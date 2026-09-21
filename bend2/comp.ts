@@ -3358,10 +3358,19 @@ const TEMPLATE = String.raw`
 
 #pragma clang fp contract(off)
 
+// HIPRTC's dialect is NVRTC's here (__shared__, __syncthreads, atomicCAS..)
+#if defined(__CUDACC_RTC__) || defined(__HIPCC_RTC__)
+#define BEND_RTC 1
+#endif
+// HIPRTC ignores NVRTC's -default-device: a plain function is a host one
+#ifdef __HIPCC_RTC__
+#pragma clang force_cuda_host_device begin
+#endif
+
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 using namespace metal;
-#elif !defined(__CUDACC_RTC__)
+#elif !defined(BEND_RTC)
 #ifndef __APPLE__
 #define _GNU_SOURCE
 #endif
@@ -3389,6 +3398,11 @@ using namespace metal;
 #elif BEND_CUDA
 #include <cuda.h>
 #include <nvrtc.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#elif BEND_HIP
+#include <hip/hip_runtime_api.h>
+#include <hip/hiprtc.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #endif
@@ -3433,7 +3447,7 @@ using namespace metal;
 #define g32_ini(p)    a32_store(p, 0)
 #define g32_add(p, v) a32_add(p, v)
 #define g32_get(p)    a32_load(p)
-#ifdef __CUDACC_RTC__
+#ifdef BEND_RTC
 // plain data stays L1-cacheable: cross-lane handoffs go through a32 + FENCE
 #define DEV
 #define GA32    __shared__ u32
@@ -3516,7 +3530,7 @@ typedef ulong u64;
 typedef uint  u32;
 typedef uchar u8;
 typedef float f32;
-#elif defined(__CUDACC_RTC__)
+#elif defined(BEND_RTC)
 typedef unsigned long long u64;
 typedef long long          int64_t;
 typedef unsigned int       u32;
@@ -3661,7 +3675,7 @@ static lock           pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pool_wake = PTHREAD_COND_INITIALIZER;
 
 // The device program compiles from the binary's own text.
-#if BEND_METAL || BEND_CUDA
+#if BEND_METAL || BEND_CUDA || BEND_HIP
 #pragma clang diagnostic ignored "-Wc23-extensions"
 static const char BEND_SRC[] = {
 #embed __FILE__
@@ -3678,6 +3692,10 @@ static id<MTLComputeCommandEncoder> gpu_enc;
 static CUdevice   gpu_dev;
 static CUmodule   gpu_lib;
 static CUfunction gpu_pso;
+#elif BEND_HIP
+static int           gpu_dev;
+static hipModule_t   gpu_lib;
+static hipFunction_t gpu_pso;
 #endif
 static bool io_gpu;
 static Stk  io_stk;
@@ -3739,7 +3757,7 @@ ${a32_ops((k) => `atomic_fetch_${k}_explicit(A32(p), v, RLX)`)}
 #define a32_swp(p, e, v) \
   atomic_compare_exchange_weak_explicit(A32(p), e, v, RLX, RLX)
 
-#elif defined(__CUDACC_RTC__)
+#elif defined(BEND_RTC)
 
 #define a32_load(p)     (*(volatile u32*)(p))
 #define a32_store(p, v) (*(volatile u32*)(p) = (v))
@@ -4792,7 +4810,7 @@ extern "C" __global__ void bend_dev(Corpus H, u32 pass) {
 // pixels itself. An Image is a quadtree over 2^k x 2^k: a Qua at level
 // i splits its square in four (tl, tr, bl, br), a Qua under the pixels
 // follows tl, a Pix is 0xRRGGBB.
-#if defined(__linux__) || defined(__CUDACC_RTC__)
+#if defined(__linux__) || defined(BEND_RTC)
 
 INLINE u32 window_pix(Corpus H, Term t, u32 k, u32 x, u32 y) {
   for (u32 i = k; term_tag(t) == TAG_CTR;) {
@@ -4807,7 +4825,7 @@ INLINE u32 window_pix(Corpus H, Term t, u32 k, u32 x, u32 y) {
   return (u32)term_loc(t) & 0xFFFFFF;
 }
 
-#ifdef __CUDACC_RTC__
+#ifdef BEND_RTC
 extern "C" __global__ void window_dev(Corpus H, Term root, u32 w, u32 h,
   u32 k, u32* out) {
   u32 x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4867,15 +4885,34 @@ static void* pool_mmap(u64 bytes) {
   return p;
 }
 
+#if BEND_HIP
+// gpu_fault calls into HIP, so the signal stack is a real one
+#define TRAP_STK (1u << 20)
+static bool gpu_fault(void* addr);
+
+static void gpu_trap(int sig, siginfo_t* si, void* uc) {
+  if (!gpu_fault(si->si_addr)) {
+    err_trap(sig);
+  }
+}
+#else
+#define TRAP_STK SIGSTKSZ
+#endif
+
 static Term* pool_stack(void) {
   u64   len = 1ull << 31;
-  char* p   = pool_mmap(len + 16384 + SIGSTKSZ);
+  char* p   = pool_mmap(len + 16384 + TRAP_STK);
   if (mprotect(p + len, 16384, PROT_NONE) != 0) {
     err_fail("stack guard failed");
   }
-  stack_t ss = { .ss_sp = p + len + 16384, .ss_size = SIGSTKSZ };
+  stack_t ss = { .ss_sp = p + len + 16384, .ss_size = TRAP_STK };
   sigaltstack(&ss, NULL);
+#if BEND_HIP
+  struct sigaction sa = { .sa_sigaction = gpu_trap,
+    .sa_flags = SA_ONSTACK | SA_SIGINFO };
+#else
   struct sigaction sa = { .sa_handler = err_trap, .sa_flags = SA_ONSTACK };
+#endif
   sigaction(SIGSEGV, &sa, NULL);
   sigaction(SIGBUS, &sa, NULL);
   return (Term*)p;
@@ -5002,11 +5039,16 @@ static void gpu_note(const char* path) {
     " stale)\n", path);
 }
 
-#if !BEND_CUDA
+#if !BEND_CUDA && !BEND_HIP
 #define gpu_map pool_mmap
 #endif
 
-#if BEND_METAL || BEND_CUDA
+#if !BEND_HIP
+#define gpu_enter()
+#define gpu_leave()
+#endif
+
+#if BEND_METAL || BEND_CUDA || BEND_HIP
 
 static void gpu_kernel(u32 pass, u32 groups);
 
@@ -5019,6 +5061,18 @@ static void gpu_run(u32 f) {
   }
   gpu_kernel(1, CUBE_G);
   gpu_kernel(2, 1);
+}
+
+#endif
+
+#if BEND_CUDA || BEND_HIP
+
+static u64 gpu_hash(void) {
+  u64 key = 14695981039346656037ull ^ CUBE_LOG;
+  for (const char* p = BEND_SRC; *p != 0; p += 1) {
+    key = (key ^ (u8)*p) * 1099511628211ull;
+  }
+  return key;
 }
 
 #endif
@@ -5164,14 +5218,6 @@ static Corpus gpu_map(u64 bytes) {
   return (Corpus)(uintptr_t)p;
 }
 
-static u64 gpu_hash(void) {
-  u64 key = 14695981039346656037ull ^ CUBE_LOG;
-  for (const char* p = BEND_SRC; *p != 0; p += 1) {
-    key = (key ^ (u8)*p) * 1099511628211ull;
-  }
-  return key;
-}
-
 static bool gpu_make(const char* path) {
   int cc[2] = {0, 0};
   cuDeviceGetAttribute(cc,
@@ -5254,6 +5300,253 @@ static void gpu_pass(u32 f) {
   if (cuCtxSynchronize() != CUDA_SUCCESS) {
     err_fail("device fault");
   }
+}
+
+#elif BEND_HIP
+
+// AMD's lane. A Radeon has no migrating managed memory, so the corpus is
+// host memory and gpu_vram its twin on the device, which a ! copies in and
+// out: every Loc is an index, and the host never runs during a device turn.
+static Corpus gpu_vram;
+
+static bool gpu_probe(void) {
+  int n = 0;
+  return hipInit(0) == hipSuccess && hipGetDeviceCount(&n) == hipSuccess
+    && n > 0 && hipSetDevice(gpu_dev) == hipSuccess;
+}
+
+// The twin's heap is lazy. After a device turn a chunk under the bump is
+// stale: no access, until a host touch downloads it and marks it dirty; a
+// turn uploads the dirty ones. The bump cannot say what the host wrote:
+// heap_free and heap_alloc rewrite freed slots under it. A fault fills a
+// chunk through gpu_alias, a second mapping, while the chunk still traps,
+// so no other host thread sees it half filled.
+#define GPU_CHUNK (1ull << 21)
+static u8*   gpu_stale;       // a flag a tracked chunk; 0 is dirty
+static char* gpu_alias;
+static u64   gpu_lo, gpu_hi;  // the tracked bytes of the corpus, whole chunks
+static u32   gpu_fault_lock;
+
+// a fresh mapping is zero; the twin is zeroed as corpus_setup does CUDA's
+static Corpus gpu_map(u64 bytes) {
+  void* v  = NULL;
+  int   fd = memfd_create("bend-corpus", 0);
+  if (fd < 0 || ftruncate(fd, (off_t)bytes) != 0) {
+    err_fail("corpus reservation failed");
+  }
+  void* p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+    MAP_SHARED | MAP_NORESERVE, fd, 0);
+  void* a = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+    MAP_SHARED | MAP_NORESERVE, fd, 0);
+  close(fd);
+  if (p == MAP_FAILED || a == MAP_FAILED) {
+    err_fail("corpus reservation failed");
+  }
+  if (hipMalloc(&v, bytes) != hipSuccess
+    || hipMemset(v, 0, STAK_OFF * 8) != hipSuccess
+    || hipDeviceSynchronize() != hipSuccess) {
+    err_fail("device corpus reservation failed");
+  }
+  gpu_vram  = (Corpus)v;
+  gpu_alias = (char*)a;
+  return (Corpus)p;
+}
+
+static bool gpu_make(const char* path) {
+  hipDeviceProp_t props;
+  if (hipGetDeviceProperties(&props, gpu_dev) != hipSuccess) {
+    err_fail("cannot compile the HIP library");
+  }
+  char arch[300];
+  char bag[24];
+  snprintf(arch, sizeof arch, "--offload-arch=%s", props.gcnArchName);
+  snprintf(bag, sizeof bag, "-DCUBE_LOG=%u", CUBE_LOG);
+  const char* opts[] = { arch, bag, "-O3", "-ffp-contract=off" };
+  hiprtcProgram prog;
+  if (hiprtcCreateProgram(&prog, BEND_SRC, "bend.hip", 0, NULL, NULL)
+    != HIPRTC_SUCCESS) {
+    err_fail("cannot compile the HIP library");
+  }
+  if (hiprtcCompileProgram(prog, 4, opts) != HIPRTC_SUCCESS) {
+    size_t n = 0;
+    hiprtcGetProgramLogSize(prog, &n);
+    char* log = calloc(n + 1, 1);
+    if (log != NULL && hiprtcGetProgramLog(prog, log) == HIPRTC_SUCCESS) {
+      fprintf(stderr, "%s\n", log);
+    }
+    err_fail("cannot compile the HIP library");
+  }
+  size_t len = 0;
+  hiprtcGetCodeSize(prog, &len);
+  char* bin = malloc(len);
+  if (bin == NULL || hiprtcGetCode(prog, bin) != HIPRTC_SUCCESS) {
+    err_fail("cannot load the HIP library");
+  }
+  hiprtcDestroyProgram(&prog);
+  u64   key = gpu_hash();
+  FILE* out = path == NULL ? NULL : fopen(path, "wb");
+  bool  ok  = out != NULL && fwrite(&key, 8, 1, out) == 1
+    && fwrite(bin, 1, len, out) == len && fclose(out) == 0;
+  if (hipModuleLoadData(&gpu_lib, bin) != hipSuccess) {
+    err_fail("cannot load the HIP library");
+  }
+  free(bin);
+  return path == NULL || ok;
+}
+
+// the twin is reserved whole: 1 GB, and --gpu 2GB asks for more
+static u64 gpu_span(void) {
+  return 1ull << 30;
+}
+
+static void gpu_load(u64 bytes) {
+  const char* path = gpu_path();
+  int         fd   = open(path, O_RDONLY);
+  struct stat st   = { 0 };
+  u64         key  = 0;
+  char*       bin  = fd < 0 || fstat(fd, &st) != 0 || st.st_size <= 8 ? NULL
+    : mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (bin != NULL && bin != MAP_FAILED) {
+    memcpy(&key, bin, 8);
+  }
+  if (key != gpu_hash()
+    || hipModuleLoadData(&gpu_lib, bin + 8) != hipSuccess) {
+    gpu_note(path);
+    gpu_make(path);
+  }
+  if (hipModuleGetFunction(&gpu_pso, gpu_lib, "bend_dev") != hipSuccess) {
+    err_fail("cannot load the GPU program");
+  }
+}
+
+static void gpu_copy(u64 lo, u64 hi, bool up) {
+  if (hi > lo && hipMemcpy(up ? (void*)(gpu_vram + lo) : (void*)(CORPUS + lo),
+    up ? (void*)(CORPUS + lo) : (void*)(gpu_vram + lo), (hi - lo) * 8,
+    up ? hipMemcpyHostToDevice : hipMemcpyDeviceToHost) != hipSuccess) {
+    err_fail("corpus copy failed");
+  }
+}
+
+// The free-list rows are the device's alone (the host keeps ALC[]) and stay
+// in VRAM. Of the rings only [get, put) is ever read: the counter planes go,
+// and the slot planes some ring has live.
+static void gpu_rings(bool up) {
+  static u8 live[1u << 17];  // RING_LEN at its widest (CUBE_LOG = 0)
+  Corpus    H = CORPUS;
+  gpu_copy(RING_OFF + RING_LEN * LANES, RING_OFF + (RING_LEN + 2) * LANES, up);
+  memset(live, 0, RING_LEN);
+  for (u32 r = 0; r < LANES; r += 1) {
+    u32 get = a32_load(ring_get(H, r));
+    u32 n   = a32_load(ring_put(H, r)) - get;
+    n = n < RING_LEN ? n : (u32)RING_LEN;
+    for (u32 i = 0; i < n; i += 1) {
+      live[(get + i) & (RING_LEN - 1)] = 1;
+    }
+  }
+  for (u64 w = 0; w < RING_LEN; w += 1) {
+    u64 lo = w;
+    while (w < RING_LEN && live[w]) {
+      w += 1;
+    }
+    gpu_copy(RING_OFF + lo * LANES, RING_OFF + w * LANES, up);
+  }
+}
+
+// The static image and the heap up to the word end. The tracked chunks are
+// the whole ones within the heap; what lies outside them goes eagerly.
+static void gpu_heap(u64 end, bool up) {
+  Corpus H = CORPUS;
+  if (gpu_stale == NULL) {
+    u64 cap = a32_load(a32_at(H, H_CAP));
+    gpu_lo = (HEAP_OFF * 8 + GPU_CHUNK - 1) & ~(GPU_CHUNK - 1);
+    gpu_hi = ((HEAP_OFF + (cap << PAGE_BITS)) * 8) & ~(GPU_CHUNK - 1);
+    gpu_hi = gpu_hi < gpu_lo ? gpu_lo : gpu_hi;
+    gpu_stale = calloc((gpu_hi - gpu_lo) / GPU_CHUNK + 1, 1);
+    if (gpu_stale == NULL) {
+      err_fail("corpus reservation failed");
+    }
+  }
+  u64 e  = end * 8;
+  u64 te = e < gpu_lo ? gpu_lo : e > gpu_hi ? gpu_hi
+    : (e + GPU_CHUNK - 1) & ~(GPU_CHUNK - 1);
+  gpu_copy(STAT_OFF, (e < gpu_lo ? e : gpu_lo) / 8, up);
+  if (e > gpu_hi) {
+    gpu_copy(gpu_hi / 8, end, up);
+  }
+  u64 n = (te - gpu_lo) / GPU_CHUNK;
+  for (u64 c = 0; up && c < n; c += 1) {
+    u64 lo = c;
+    while (c < n && !gpu_stale[c]) {
+      c += 1;
+    }
+    gpu_copy((gpu_lo + lo * GPU_CHUNK) / 8, (gpu_lo + c * GPU_CHUNK) / 8, up);
+  }
+  if (!up && n != 0) {
+    LOCK(gpu_fault_lock);
+    if (mprotect((char*)H + gpu_lo, te - gpu_lo, PROT_NONE) != 0) {
+      err_fail("corpus protection failed");
+    }
+    memset(gpu_stale, 1, n);
+    UNLOCK(gpu_fault_lock);
+  }
+}
+
+static bool gpu_fault(void* addr) {
+  u64 off = (u64)((char*)addr - (char*)CORPUS);
+  if (gpu_stale == NULL || (char*)addr < (char*)CORPUS || off < gpu_lo
+    || off >= gpu_hi) {
+    return false;
+  }
+  u64  c  = (off - gpu_lo) / GPU_CHUNK;
+  u64  at = gpu_lo + c * GPU_CHUNK;
+  bool ok = true;
+  LOCK(gpu_fault_lock);
+  if (gpu_stale[c]) {
+    ok = hipMemcpy(gpu_alias + at, (char*)gpu_vram + at, GPU_CHUNK,
+      hipMemcpyDeviceToHost) == hipSuccess
+      && mprotect((char*)CORPUS + at, GPU_CHUNK, PROT_READ | PROT_WRITE) == 0;
+    gpu_stale[c] = !ok;
+  }
+  UNLOCK(gpu_fault_lock);
+  return ok;
+}
+
+// what a turn can touch, but the lanes' stacks; down, the header leads
+static void gpu_sync(bool up) {
+  Corpus H = CORPUS;
+  gpu_copy(0, ALC_OFF, up);
+  gpu_rings(up);
+  gpu_heap(HEAP_OFF + (((u64)a32_load(a32_at(H, H_BUMP)) + 1) << PAGE_BITS),
+    up);
+  for (Cls c = 0; c < NCLS_ALL; c += 1) {
+    Bank* b = bank_at(H, c);
+    u32   n = b->wr > b->rd ? b->wr : b->rd;
+    n = b->top > n ? b->top : n;
+    gpu_copy(b->off, b->off + n + 1, up);
+  }
+}
+
+#define gpu_enter() gpu_sync(true)
+#define gpu_leave() gpu_sync(false)
+
+static void gpu_kernel(u32 pass, u32 groups) {
+  struct { Corpus mem; u32 pass; } args = { gpu_vram, pass };
+  size_t len   = sizeof args;
+  void*  cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
+    HIP_LAUNCH_PARAM_BUFFER_SIZE, &len, HIP_LAUNCH_PARAM_END };
+  if (hipModuleLaunchKernel(gpu_pso, groups, 1, 1, CUBE_T, 1, 1, TG_HOLD * 8,
+    NULL, NULL, cfg) != hipSuccess) {
+    err_fail("device launch failed");
+  }
+}
+
+static void gpu_pass(u32 f) {
+  gpu_copy(0, ALC_OFF, true);
+  gpu_run(f);
+  if (hipDeviceSynchronize() != hipSuccess) {
+    err_fail("device fault");
+  }
+  gpu_copy(0, ALC_OFF, false);
 }
 
 #else
@@ -5406,7 +5699,9 @@ OUTLINE Term corpus_eval(Corpus H, Term t) {
         H[tl]     = TERM_HOLE;
         a32_store(a32_at(H, H_CURSOR), 1);
         ring_push(H, 0, t);
+        gpu_enter();
         cube_run(H, true);
+        gpu_leave();
         Term p = task_deliver(H, cont, idx, rv, root_take(H, rv));
         if (root_done(H)) {
           break;
