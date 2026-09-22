@@ -1961,6 +1961,17 @@ function arr_new(fl: File, d: string, v: Val, el: Lay): string {
   return `blk_new(e, ${Number(arr)}, ${d}, ${lgs}, ${ws.length}, ${fv})`;
 }
 
+function arr_q(fl: File, k: Kind): boolean {
+  return k === "box" && fl.hot.has("t:Array");
+}
+
+function arr_loc(fl: File, a: string): string {
+  const p = fl.seg.params.indexOf(a);
+  return fl.seg.ks.reduce((s, k, i) => fl.seg.fid.startsWith("spin_")
+    && arr_q(fl, k) && (p < 0 || p === i)
+    ? `${a} == h${i} ? q${i} : ${s}` : s, `blk_loc(e.mem, ${a})`);
+}
+
 function arr_op(fl: File, k: string, el: Lay, args: Val[]): Val {
   const { arr, lgs } = lay_arr(el);
   switch (k) {
@@ -1974,7 +1985,7 @@ function arr_op(fl: File, k: string, el: Lay, args: Val[]): Val {
     }
     default: {
       const a = emit_alias(fl, val_own(fl, args[0])[0], "a");
-      const [l, at] = emit_hold(fl, [`blk_loc(e.mem, ${a})`,
+      const [l, at] = emit_hold(fl, [arr_loc(fl, a),
         `blk_at(${a}, ${val_word(args[1])}, ${lgs})`], "at");
       if (k === "array_get") {
         return val_new([a, ...arr_cells(fl, l, at, el, "blk_keep(e, $)").ws],
@@ -1995,7 +2006,7 @@ function arr_op(fl: File, k: string, el: Lay, args: Val[]): Val {
 }
 
 function arr_leaf(fl: File, s: string, el: Lay): Val {
-  const got = arr_cells(fl, `blk_loc(e.mem, ${s})`, "0", el,
+  const got = arr_cells(fl, arr_loc(fl, s), "0", el,
     `blk_shr(${s}) ? blk_keep(e, $) : e.mem[$]`);
   file_push(fl, `blk_free(e, ${s});`);
   return got;
@@ -2192,7 +2203,10 @@ function emit_fuse(fl: File, ck: Call, dst: Dst, tail = false): void {
   const name = emit_native(fl, ck, ers);
   const o = name_local(fl, "o");
   file_push(fl, `Term ${o}[${out.ws.length}];`);
-  block(fl, `if (${name}(${["e", o, ...ws].join(", ")}) == 0) {`, () => {
+  const ks = lays.flatMap((l) => l.ks);
+  const xs = ws.flatMap((w, i) => !arr_q(fl, ks[i]) ? [w]
+    : [w = emit_alias(fl, w, "a"), arr_loc(fl, w)]);
+  block(fl, `if (${name}(${["e", o, ...xs].join(", ")}) == 0) {`, () => {
     file_push(fl, "return 0;");
   });
   out.ws.forEach((v, j) => file_push(fl, `${v} = ${o}[${j}];`));
@@ -2234,8 +2248,10 @@ function emit_native(fl: File, ck: Call, ers: HTerm[]): string {
   const dst = val_new(seg.ret.ks.map(() => name_local(fl, "v")), seg.ret);
   emit_body(fl, tld.h as HTerm, tld.T, ers, vals, dst);
   fl.spins.push([name, [`${seg.lines.length < SPIN_FAR ? "INLINE" : "FAR"} Term ${name}(Env e, THR Term* o${
-    seg.ks.map((k, i) => `, ${lay_c(k)} r${i}`).join("")}) {`,
-  "  u32 wpoll = 0;",
+    seg.ks.map((k, i) => `, ${lay_c(k)} r${i}${arr_q(fl, k)
+      ? `, Loc q${i}` : ""}`).join("")}) {`,
+  "  u32 wpoll = 0;", ...seg.ks.flatMap((k, i) =>
+    arr_q(fl, k) ? [`  Term h${i} = r${i};`] : []),
   ...dst.ws.map((v, j) => `  ${lay_c(seg.ret.ks[j])} ${v} = 0;`),
   ...seg_take(seg).map((l) => "  " + l),
   "  WL_SPIN", ...seg.lines, "  break;", "  }",
