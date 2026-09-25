@@ -88,7 +88,7 @@ def main() -> IO(Unit):
       Process.run("/bin/sh", ["-c", "sleep 3 & echo hi"], "", 128, 1500)
     IO.print("inherited pipe: " ++ answer(p, 0, "hi\n", ""))
     q : Result<&1, &1, U32 & String, U32 & (String & String)> <-
-      Process.run("/bin/sh", ["-c", "yes & echo hi"], "", 65536, 1500)
+      Process.run("/bin/sh", ["-c", "yes & echo hi"], "", 1048576, 1500)
     IO.print("descendant output: " ++ contains_answer(q, 0, "hi"))
 
 #|stdin: True
