@@ -2,6 +2,7 @@
 // =======
 
 #include <spawn.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 
 extern char** environ;
@@ -60,6 +61,39 @@ static bool process_append(ProcessCall* p, bool error, const char* data,
   return true;
 }
 
+static bool process_drain(ProcessCall* p, int fd, bool error) {
+  int pending = 0;
+  int got;
+  do {
+    got = ioctl(fd, FIONREAD, &pending);
+  } while (got != 0 && errno == EINTR);
+  if (got != 0) {
+    p->code = errno;
+    return false;
+  }
+  while (pending > 0) {
+    char buf[8192];
+    size_t size = pending < (int)sizeof(buf) ? (size_t)pending : sizeof(buf);
+    ssize_t n = read(fd, buf, size);
+    if (n > 0) {
+      if (!process_append(p, error, buf, (u64)n)) {
+        return false;
+      }
+      pending -= n;
+    } else if (n == 0) {
+      break;
+    } else if (errno == EINTR) {
+      continue;
+    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      break;
+    } else {
+      p->code = errno;
+      return false;
+    }
+  }
+  return true;
+}
+
 static int process_nonblock(int fd) {
   int flags = fcntl(fd, F_GETFL);
   return flags < 0 ? -1 : fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -90,6 +124,7 @@ static void process_call(IoWork* w) {
   int pipes[3][2] = {{-1, -1}, {-1, -1}, {-1, -1}};
   pid_t child = -1;
   int status = 0;
+  bool drain = false;
   for (int i = 0; i < 3; i += 1) {
     if (process_pipe(pipes[i]) != 0) {
       p->code = errno;
@@ -163,6 +198,7 @@ static void process_call(IoWork* w) {
       pid_t got = waitpid(child, &status, WNOHANG);
       if (got == child) {
         child = -1;
+        drain = true;
         if (pipes[0][1] >= 0) {
           close(pipes[0][1]); pipes[0][1] = -1;
         }
@@ -170,6 +206,14 @@ static void process_call(IoWork* w) {
         p->code = errno;
         break;
       }
+    }
+    if (drain) {
+      for (int i = 1; i < 3; i += 1) {
+        if (pipes[i][0] >= 0 && !process_drain(p, pipes[i][0], i == 2)) {
+          break;
+        }
+      }
+      break;
     }
     u64 now = io_tick();
     if (child >= 0 && now >= deadline) {
