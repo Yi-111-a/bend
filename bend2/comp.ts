@@ -6316,9 +6316,23 @@ function io_sys() {
   return globalThis.BEND_SYS;
 }
 
+// The text is strerror's on a host with libc bound through bun:ffi, which
+// a node host does not have: without this a Fail outside Bun raised the
+// missing-module error instead of answering the declared Result. Every
+// effect that answers Fail -- get_env, file_open, process_run,
+// random_u32 -- goes through io_fail, so one fallback covers the lot, and
+// the bare number stands in for a text the C lane reads out of libc.
+function io_strerror(code) {
+  try {
+    return String(io_sys().strerror(code));
+  } catch (_) {
+    return "errno " + code;
+  }
+}
+
 function io_fail(code) {
   return { $: "Fail",
-    error: io_tup(code >>> 0, String(io_sys().strerror(code))) };
+    error: io_tup(code >>> 0, io_strerror(code)) };
 }
 
 function io_done(value) {
