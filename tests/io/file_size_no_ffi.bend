@@ -12,6 +12,9 @@ import Base
 def ffi_absent() -> IO(Unit):
   import "./file_size_no_ffi.js"
 
+def ffi_back() -> IO(Unit):
+  import "./file_size_no_ffi.js"
+
 def describe(r: Result<&1, &1, U32 & String, U32>) -> String:
   match r:
     case Done{got}:
@@ -47,6 +50,7 @@ def main() -> IO(Unit):
     f : File <- wrote(p)
     u : Unit <- ffi_absent()
     p : File & Result<&1, &1, U32 & String, U32> <- File.size(f)
+    v : Unit <- ffi_back()
     f : File <- report(p)
     File.close(f)
 
