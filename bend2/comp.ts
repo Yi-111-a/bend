@@ -6316,13 +6316,7 @@ function io_sys() {
   return globalThis.BEND_SYS;
 }
 
-// The text is strerror's on a host with libc bound through bun:ffi, which
-// a node host does not have: without this a Fail outside Bun raised the
-// missing-module error instead of answering the declared Result. Every
-// effect that answers Fail goes through io_fail, so one fallback covers
-// the lot, and the bare number stands in for a text the C lane reads out
-// of libc. The list of those effects is deliberately not written here: it
-// grows with every effect file and would only ever be stale.
+// strerror needs bun:ffi; a host without it (node) gets the bare errno.
 function io_strerror(code) {
   try {
     return String(io_sys().strerror(code));
