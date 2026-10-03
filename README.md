@@ -246,7 +246,7 @@ def add_zero(x):
 - The Lean formalization and bend.ts mismatch. Early consistency bugs may occur.
 - A binary needs clang 14+; ! needs 19+, Metal or CUDA 12.
 - No Windows (WSL works); on Linux, Window and Audio need X11 and ALSA headers.
-- The hub has no names, versions, accounts or search yet. Packages are hashes.
+- A hub package is a hash, unless its author names and versions it after `bend login`.
 - Error messages are terse; no debugger, profiler or REPL.
 - The bundled editor support is limited to formatting; the community [bend2-lsp](https://github.com/don2e4/bend2-lsp) provides diagnostics and hover, but no completion.
 - No test framework and no documentation beyond the guide.
