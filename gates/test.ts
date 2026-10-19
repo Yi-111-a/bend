@@ -201,13 +201,12 @@ async function shard_run(shard: Test[], pack: Buffer, tag: number,
 // State
 // =====
 
-// A process may compile many books (the bun loader, io_run), and none may
-// leave state for the next: #976 kept every book's probes, with the same
-// bytes. Each fixture loads and checks twice. Its first copy's C and JS
-// are the baseline (compiled after the earlier fixtures' baselines, not in
-// a fresh process); its second copy must match them, bytes and probes left,
-// at every step: C, C, JS, C, normalization, JS, C, the next fixture (+),
-// C, JS. It builds and runs nothing: the shards run these programs.
+// A process may compile many books (the bun loader, io_run). Compile two
+// separately checked copies to catch stale state crossing compilations,
+// normalization and other books. The first copies establish the baselines;
+// each later emission is compared by hash. Byte equality is a cheap check
+// for these fixtures, not a compatibility promise for private symbols.
+// It builds and runs nothing: the shards run these programs.
 async function state_run(): Promise<Fail[]> {
   const files = ["reg/borrow_loop", "run/harness_cache_compile",
     "run/harness_cache_purity", "run/harness_cache_stats"];

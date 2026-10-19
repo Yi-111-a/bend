@@ -39,9 +39,9 @@ def ordinary(x: U32) -> U32:
     const names = Object.keys(lib);
     const Bend = require(path.resolve("bend2/bend.ts"));
     const file = Bend.name_escape(fs.realpathSync(input));
-    if (names.length !== keys.length * 2 || keys.some((k, i) =>
-      names[i * 2] !== k || names[i * 2 + 1] !== Bend.name_source(file, k)
-      || lib[names[i * 2 + 1]] !== lib[k])) {
+    if (names.length !== keys.length * 2 || keys.some((k) =>
+      !Object.hasOwn(lib, Bend.name_source(file, k))
+      || lib[Bend.name_source(file, k)] !== lib[k])) {
       return 3;
     }
     if (Object.getPrototypeOf(lib) !== null) {
@@ -49,8 +49,8 @@ def ordinary(x: U32) -> U32:
     }
     const copy = { ...lib };
     return Object.getPrototypeOf(copy) === Object.prototype
-      && names.every((k, i) => Object.hasOwn(copy, k)
-        && lib[k](5) === (i >> 1) + 6 && copy[k](5) === (i >> 1) + 6) ? 0 : 5;
+      && names.every((k) => Object.hasOwn(copy, k) && copy[k] === lib[k])
+      && keys.every((k, i) => lib[k](5) === i + 6 && copy[k](5) === i + 6) ? 0 : 5;
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
